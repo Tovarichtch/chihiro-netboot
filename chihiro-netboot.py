@@ -28,6 +28,7 @@ import argparse
 import array
 import shutil
 import time
+import threading
 import ctypes
 import ctypes.util
 from ctypes import (POINTER, byref, c_char_p, c_int, c_size_t, c_ulong,
@@ -358,10 +359,20 @@ def tool_dir():
 
 
 def find_chdman():
-    # Locate chdman: next to this tool, in the current dir, then in PATH.
+    # Locate chdman: in temp, next to this tool, in the current dir, then in PATH.
+    temp_chdman = os.path.join(tempfile.gettempdir(), "chdman.exe" if os.name == "nt" else "chdman")
+    if os.path.isfile(temp_chdman):
+        return temp_chdman
+
     exe = "chdman.exe" if os.name == "nt" else "chdman"
     for candidate in (os.path.join(tool_dir(), exe), os.path.join(".", exe)):
         if os.path.isfile(candidate):
+            if os.name == "nt" and not candidate.lower().startswith("c:"):
+                try:
+                    shutil.copyfile(candidate, temp_chdman)
+                    return temp_chdman
+                except Exception:
+                    pass
             return candidate
     return shutil.which("chdman")
 
@@ -399,8 +410,19 @@ def extract_chd(chd_path):
     proc = subprocess.Popen(
         [chdman, "extractcd", "-i", chd_path,
          "-o", cue_path, "-ob", bin_pattern],
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
     )
+
+    output_chunks = []
+    def drain_output():
+        while True:
+            chunk = proc.stdout.read(512)
+            if not chunk:
+                break
+            output_chunks.append(chunk)
+
+    drain_thread = threading.Thread(target=drain_output, daemon=True)
+    drain_thread.start()
 
     spinner = "|/-\\"
     tick = 0
@@ -409,12 +431,13 @@ def extract_chd(chd_path):
         tick += 1
         time.sleep(0.15)
 
-    _, stderr = proc.communicate()
+    drain_thread.join()
     print("\r  Running chdman... done" + " " * 10)
 
     if proc.returncode != 0:
         shutil.rmtree(tmp_dir, ignore_errors=True)
-        raise RuntimeError(f"chdman failed: {stderr.strip()}")
+        stderr_msg = "".join(output_chunks).strip()
+        raise RuntimeError(f"chdman failed: {stderr_msg}")
 
     # Detect sector format from CUE
     sector_size = 2352
@@ -516,7 +539,17 @@ def load_track_data(chd_path):
         with open(track_path, "rb") as f:
             data = f.read()
         progress(file_size, file_size)
-        return data, tmp_dir, 0
+
+        # Detect whether the 2048-byte track was mastered with GD-ROM (45000) or CD/DVD (0) LBA
+        detected_offset = 0
+        if len(data) >= 17 * 2048:
+            pvd = data[16 * 2048:17 * 2048]
+            if len(pvd) == 2048 and pvd[0] == 0x01 and pvd[1:6] == b"CD001":
+                root_lba = struct.unpack_from("<I", pvd, 156 + 2)[0]
+                if root_lba >= GD_LBA_OFFSET:
+                    detected_offset = GD_LBA_OFFSET
+
+        return data, tmp_dir, detected_offset
 
     sector_count = file_size // 2352
     total_out = sector_count * 2048
@@ -577,6 +610,8 @@ def parse_directory(iso_data, dir_lba, dir_size, lba_offset):
     pos = 0
 
     while pos < dir_size:
+        if base + pos >= len(iso_data) or base + pos < 0:
+            break
         rec_len = iso_data[base + pos]
         if rec_len == 0:
             next_sector = ((pos // 2048) + 1) * 2048
@@ -746,10 +781,13 @@ def find_games(directory="."):
         # MAME layout: gamename/something.chd, or a Redump gamename/*.cue
         subdir = os.path.join(directory, game_name)
         if os.path.isdir(subdir):
-            for f in sorted(os.listdir(subdir)):
-                if f.lower().endswith((".chd", ".cue")):
-                    gdrom = os.path.join(subdir, f)
-                    break
+            candidates = [
+                os.path.join(subdir, f) for f in os.listdir(subdir)
+                if f.lower().endswith((".chd", ".cue"))
+            ]
+            if candidates:
+                # Pick largest disc image (avoids auxiliary patch/key discs like cdp-*)
+                gdrom = max(candidates, key=os.path.getsize)
 
         # Flat layout: gamename.chd or gamename.cue
         if not gdrom:
@@ -852,16 +890,61 @@ def convert_game(game_name, zip_path, gdrom_path, output_dir="output",
             break
 
         if des_key is None:
-            # No loader found; try the largest file with the first key (CD-ROM format)
-            largest = find_largest_file(iso_data, lba_offset)
-            if not largest or not key_candidates:
-                print(f"  ERROR: No matching key/loader found on disc.")
+            if not key_candidates:
+                print(f"  ERROR: No key candidates found.")
                 return None
-            fatx_name, fatx_lba, fatx_size = largest
-            des_key = key_candidates[0][0]
-            print(f"  Source:  {key_candidates[0][2]}")
-            print(f"  Key:     {des_key.hex().upper()}")
-            print(f"  FATX blob: {fatx_name} (largest file on disc)")
+
+            # Probe candidate files by test-decrypting the first block for FATX magic header.
+            # Exclude media container files (.afs, .adx, .sfd, video/audio formats).
+            media_exts = (".afs", ".adx", ".sfd", ".mpg", ".mpeg", ".avi", ".wmv", ".wav")
+            all_files = list_all_files(iso_data, lba_offset)
+            candidates = sorted(
+                [f for f in all_files if not f[0].lower().endswith(media_exts) and f[2] >= 1024 * 1024 and f[2] % 8 == 0],
+                key=lambda x: (x[0].lower().endswith((".img", ".bin")), x[2]),
+                reverse=True,
+            )
+
+            backend_name, des_decrypt_fn = get_des_backend()
+
+            for path, f_lba, f_size in candidates:
+                sample_len = min(512, f_size)
+                if sample_len % 8 != 0:
+                    continue
+                sample = extract_file_data(iso_data, f_lba, sample_len, lba_offset)
+                for k, _, src in key_candidates:
+                    if k:
+                        rev_k = k[::-1]
+                        swapped = byteswap_blocks(sample)
+                        dec = des_decrypt_fn(swapped, rev_k)
+                        if byteswap_blocks(dec)[:4] == b"FATX":
+                            des_key = k
+                            key_source = src
+                            fatx_name = os.path.basename(path)
+                            fatx_lba = f_lba
+                            fatx_size = f_size
+                            print(f"  Source:  {key_source}")
+                            print(f"  Key:     {des_key.hex().upper()}")
+                            print(f"  FATX blob: {path} (verified FATX magic)")
+                            break
+                if des_key:
+                    break
+
+            # If no candidate matched FATX magic, fallback to the largest candidate file
+            if des_key is None:
+                fallback_cand = candidates[0] if candidates else find_largest_file(iso_data, lba_offset)
+                if not fallback_cand:
+                    print(f"  ERROR: No matching key/loader found on disc.")
+                    return None
+                if isinstance(fallback_cand[0], str) and fallback_cand[0].startswith("/"):
+                    fatx_name = os.path.basename(fallback_cand[0])
+                    fatx_lba = fallback_cand[1]
+                    fatx_size = fallback_cand[2]
+                else:
+                    fatx_name, fatx_lba, fatx_size = fallback_cand
+                des_key = key_candidates[0][0]
+                print(f"  Source:  {key_candidates[0][2]}")
+                print(f"  Key:     {des_key.hex().upper()}")
+                print(f"  FATX blob: {fatx_name} (largest candidate file)")
 
         print(f"  Size:      {fatx_size / 1024 / 1024:.0f} MB")
 
